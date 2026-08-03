@@ -184,12 +184,9 @@ func TestPanicInGoroutineFailsTestNotProcess(t *testing.T) {
 	// Reaching here at all proves the process didn't crash.
 }
 
-// TestParallelNoCrossTestInterference is the headline capability: many tests
-// run under t.Parallel at once, each owning goroutines that stay alive across
-// the whole parallel window. A snapshot/diff detector would see other tests'
-// goroutines in its window and misfire. parleak tracks explicitly, so each
-// subtest only ever waits for, and reports on, its own goroutines. Every
-// subtest here uses a real *testing.T, so a false leak report would fail it.
+// TestParallelNoCrossTestInterference runs many subtests under t.Parallel, each
+// owning goroutines that stay alive across the whole parallel window. Each
+// subtest uses a real *testing.T, so a false leak report would fail it.
 func TestParallelNoCrossTestInterference(t *testing.T) {
 	t.Parallel()
 
@@ -200,9 +197,7 @@ func TestParallelNoCrossTestInterference(t *testing.T) {
 
 			g := parleak.New(t)
 
-			// Each subtest owns two goroutines that live until this subtest's
-			// own context is cancelled at cleanup. Their lifetimes overlap
-			// every other subtest's goroutines on purpose.
+			// Two goroutines that live until this subtest's context is cancelled.
 			started := make(chan struct{}, 2)
 			g.Go("poller", func(ctx context.Context) {
 				started <- struct{}{}
@@ -221,12 +216,11 @@ func TestParallelNoCrossTestInterference(t *testing.T) {
 				<-ctx.Done()
 			})
 
-			// Make sure both are actually running before the subtest returns,
-			// so the parallel windows genuinely overlap.
+			// Both must be running before the subtest returns.
 			<-started
 			<-started
 
-			// Stagger completion so subtests finish in a jumbled order.
+			// Stagger completion.
 			time.Sleep(time.Duration(i%5) * time.Millisecond)
 		})
 	}
@@ -247,9 +241,8 @@ func TestContextIsCancelledOnCleanup(t *testing.T) {
 	}
 }
 
-// TestGoAfterCleanupIsNotTracked pins the lifecycle boundary: check seals the
-// group and snapshots the tracked goroutines together, so a Go that lands after
-// the check has begun is not tracked and cannot produce a spurious late report.
+// TestGoAfterCleanupIsNotTracked checks that a Go landing after the leak check
+// has begun is not tracked and produces no late report.
 func TestGoAfterCleanupIsNotTracked(t *testing.T) {
 	t.Parallel()
 
@@ -262,8 +255,7 @@ func TestGoAfterCleanupIsNotTracked(t *testing.T) {
 	defer close(release)
 	g.Go("late", func(ctx context.Context) { <-release }) // ignores ctx on purpose
 
-	// The goroutine is running and will not return, but because it started after
-	// the check it is untracked, so no leak is reported.
+	// It runs and never returns, but started after the check, so it is untracked.
 	time.Sleep(40 * time.Millisecond)
 	if got := ft.failures(); len(got) != 0 {
 		t.Fatalf("a goroutine started after cleanup must not be tracked or reported, got: %v", got)
@@ -290,17 +282,15 @@ func TestZeroTimeoutReportsImmediately(t *testing.T) {
 	}
 }
 
-// TestDefaultOutputIsBoundedAndDumpIsOptIn guards two related properties found
-// the hard way in end-to-end stress runs: a process-wide goroutine dump per
-// failing test produced ~1.18MB / 19k lines, most of it other parallel tests'
-// goroutines. By default parleak emits only the short per-leak report; the dump
-// is opt-in via WithStackDump and, when on, appears exactly once per check.
+// TestDefaultOutputIsBoundedAndDumpIsOptIn checks that the default output is one
+// short report per leak, and that WithStackDump adds exactly one process-wide
+// dump per check.
 func TestDefaultOutputIsBoundedAndDumpIsOptIn(t *testing.T) {
 	t.Parallel()
 
 	labels := []string{"leak-a", "leak-b", "leak-c"}
 
-	// Default: sharp per-leak reports only, no process-wide dump.
+	// Default: one report per leak, no dump.
 	release1 := make(chan struct{})
 	defer close(release1)
 	ftDefault := &fakeT{}
@@ -323,13 +313,13 @@ func TestDefaultOutputIsBoundedAndDumpIsOptIn(t *testing.T) {
 			t.Fatalf("expected a report naming %q, got: %v", name, def)
 		}
 	}
-	// The 1.18MB / 19k-line regression must not come back: a few leaks stay tiny.
+	// A few leaks stay small; the default must not balloon into a dump.
 	const ceiling = 4 << 10
 	if n := len(defJoined); n > ceiling {
 		t.Fatalf("default output for %d leaks was %d bytes, over the %d-byte ceiling", len(labels), n, ceiling)
 	}
 
-	// Opt in with WithStackDump: the same sharp reports, plus exactly one dump.
+	// With WithStackDump: same reports, plus one dump.
 	release2 := make(chan struct{})
 	defer close(release2)
 	ftDump := &fakeT{}

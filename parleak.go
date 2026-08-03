@@ -40,13 +40,12 @@ func WithTimeout(d time.Duration) Option {
 	return func(c *config) { c.timeout = d }
 }
 
-// WithStackDump appends a goroutine dump to a failing check, once per check. The
-// dump is the process-wide output of [runtime.Stack], so it also contains
+// WithStackDump appends a process-wide goroutine dump to the leak reports, once
+// per check. The dump is the raw output of [runtime.Stack]; it contains
 // goroutines from other tests running in parallel and is not trimmed to the
-// leaked ones. To read a leaked goroutine's stack, find it in the dump by the
-// label and launch site from the per-leak report. Use it when the launch site
-// alone is not enough and you need to see where the goroutine is blocked. It is
-// off by default.
+// leaked ones. Identify a worker by its own function names and blocking state:
+// the frame directly below its "created by parleak..." line is the function
+// passed to Go. The label does not appear in the dump.
 func WithStackDump() Option {
 	return func(c *config) { c.stackDump = true }
 }
@@ -56,8 +55,8 @@ func WithStackDump() Option {
 // cancelled and a timeout elapses. Create a Group with New.
 //
 // A Group is safe for concurrent use, and Go may be called from any goroutine
-// while the test runs. All calls to Go must happen before the test's cleanup
-// runs; a goroutine started after the cleanup check has begun is not tracked.
+// while the test runs. A goroutine started after the cleanup check has begun is
+// not included in leak detection.
 type Group struct {
 	t      TB
 	cfg    config
@@ -117,13 +116,15 @@ func New(t TB, opts ...Option) *Group {
 func (g *Group) Context() context.Context { return g.ctx }
 
 // Go starts fn in a new goroutine tracked by the Group. The label names the
-// goroutine in any failure message, and the call site of Go is captured
-// automatically as its launch site.
+// goroutine in a failure message, and Go records its own call site as the
+// launch site.
 //
 // fn receives the Group's context and is expected to return when that context
-// is done. If it doesn't, the cleanup registered by New reports it as a leak.
-// A panic in fn is recovered and reported as a test failure rather than
-// crashing the process; see the package comment for the exact behavior.
+// is done. If it does not, the cleanup registered by New reports it as a leak.
+//
+// A panic in fn is recovered rather than crashing the process. If it happens
+// before the group's leak check records its verdict, it fails the owning test.
+// A later panic can no longer fail the test and is written to standard error.
 func (g *Group) Go(label string, fn func(ctx context.Context)) {
 	_, file, line, _ := runtime.Caller(1)
 	tr := &tracked{label: label, file: file, line: line, done: make(chan struct{})}
@@ -147,10 +148,8 @@ func (g *Group) Go(label string, fn func(ctx context.Context)) {
 			reportedLate := g.closed
 			g.mu.Unlock()
 			if reportedLate {
-				// The group's check has already recorded its verdict (closed is
-				// set during cleanup), so this goroutine can no longer fail the
-				// test. The panic is recovered to keep the process alive and
-				// noted on stderr.
+				// The check already recorded its verdict, so this panic can no
+				// longer fail the test. It is recovered and noted on stderr.
 				fmt.Fprintf(os.Stderr, "parleak: goroutine %q panicked after its group's leak check finished: %v\n%s\n",
 					tr.label, r, stack)
 			}
@@ -165,9 +164,8 @@ func (g *Group) check() {
 	g.t.Helper()
 	g.cancel()
 
-	// Seal the group and snapshot the tracked goroutines under the same lock, so
-	// the snapshot is final: a Go racing with cleanup either lands before the
-	// seal and is in the snapshot, or lands after and is not tracked.
+	// Seal and snapshot under one lock, so a Go racing with cleanup either lands
+	// before the seal and is tracked, or after and is not.
 	g.mu.Lock()
 	g.sealed = true
 	list := make([]*tracked, len(g.tracked))
@@ -190,14 +188,10 @@ func (g *Group) check() {
 		return
 	}
 
-	// The label and launch site pin each leak, so the per-leak report is the
-	// default and only output.
 	for _, tr := range leaked {
 		g.t.Errorf("%s", formatLeak(tr, g.cfg.timeout))
 	}
 
-	// The process-wide dump is opt-in via WithStackDump; when on, emit it once
-	// per check regardless of how many goroutines leaked.
 	if g.cfg.stackDump {
 		dump := stripReporterFrame(captureStack(true))
 		g.t.Errorf("%s", formatDump(len(leaked), dump))
@@ -245,13 +239,11 @@ func formatLeak(tr *tracked, timeout time.Duration) string {
 	return b.String()
 }
 
-// formatDump renders the process-wide goroutine dump that accompanies a leak
-// report. It's emitted once per check, not once per leaked goroutine.
+// formatDump renders the process-wide goroutine dump, once per check.
 func formatDump(n int, dump []byte) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "parleak: %d goroutine(s) leaked; dumping every goroutine in the process below "+
-		"(not just the leaked ones. The launch sites above pin those; parleak can't single a "+
-		"goroutine out of the dump without unsound goroutine-ID matching):\n", n)
+	fmt.Fprintf(&b, "parleak: %d goroutine(s) leaked; dumping every goroutine in the process, "+
+		"including goroutines from other tests:\n", n)
 	b.WriteString(indent(string(dump)))
 	return b.String()
 }
@@ -280,11 +272,9 @@ func captureStack(all bool) []byte {
 	}
 }
 
-// stripReporterFrame drops the leading stack block belonging to parleak's own
-// cleanup goroutine, the one that called runtime.Stack, so the dump opens on
-// application goroutines rather than library internals. runtime.Stack always
-// lists the calling goroutine first. This isn't leak attribution: it only
-// removes the reporter's own frame, which is always present and never useful.
+// stripReporterFrame drops the leading stack block, which belongs to parleak's
+// own goroutine calling runtime.Stack. runtime.Stack lists the calling
+// goroutine first.
 func stripReporterFrame(dump []byte) []byte {
 	const sep = "\n\n"
 	s := string(dump)
