@@ -3,101 +3,53 @@ package parleak_test
 import (
 	"context"
 	"fmt"
+	"strings"
+	"time"
 
 	"github.com/slepp/parleak"
 )
 
-// exampleTB stands in for *testing.T so these examples are self-contained and
-// runnable under `go test`. Real code passes its *testing.T to parleak.New.
-type exampleTB struct {
+// fakeTB stands in for *testing.T. An example function does not receive a
+// *testing.T, so this records failures instead of failing, which lets the
+// example print what parleak reported. Real tests pass their own *testing.T to
+// parleak.New; see the New documentation for that form.
+type fakeTB struct {
 	errors   []string
 	cleanups []func()
 }
 
-func (e *exampleTB) Errorf(format string, args ...any) {
-	e.errors = append(e.errors, fmt.Sprintf(format, args...))
+func (f *fakeTB) Errorf(format string, args ...any) {
+	f.errors = append(f.errors, fmt.Sprintf(format, args...))
 }
-func (e *exampleTB) Cleanup(fn func()) { e.cleanups = append(e.cleanups, fn) }
-func (e *exampleTB) Helper()           {}
+func (f *fakeTB) Cleanup(fn func()) { f.cleanups = append(f.cleanups, fn) }
+func (f *fakeTB) Helper()           {}
 
-// cleanup runs what testing would run when the test ends.
-func (e *exampleTB) cleanup() {
-	for i := len(e.cleanups) - 1; i >= 0; i-- {
-		e.cleanups[i]()
+// runCleanups runs the registered cleanups in LIFO order, as testing does when
+// a test ends.
+func (f *fakeTB) runCleanups() {
+	for i := len(f.cleanups) - 1; i >= 0; i-- {
+		f.cleanups[i]()
 	}
 }
 
-// Example tracks a background poller. The poller returns when the group context
-// is cancelled, so cleanup finds no leak.
-func Example() {
-	t := &exampleTB{} // a real test passes its *testing.T
+// Example_leak shows what parleak reports when a tracked goroutine ignores
+// cancellation and is still running when the test's cleanup checks it.
+func Example_leak() {
+	release := make(chan struct{})
+	defer close(release)
 
-	g := parleak.New(t)
-
-	readings := make(chan int)
+	t := &fakeTB{}
+	g := parleak.New(t, parleak.WithTimeout(10*time.Millisecond))
 	g.Go("poller", func(ctx context.Context) {
-		n := 0
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case readings <- n:
-				n++
-			}
-		}
+		<-release // never checks ctx.Done, so it outlives the test
 	})
 
-	fmt.Println(<-readings, <-readings, <-readings)
+	t.runCleanups() // testing runs the registered cleanup when a test ends
 
-	t.cleanup() // testing runs the leak check here automatically
-	fmt.Println("clean:", len(t.errors) == 0)
-
-	// Output:
-	// 0 1 2
-	// clean: true
-}
-
-// ExampleGroup_workerPool tracks a pool of workers draining a job channel. Each
-// worker returns when the jobs run out or the context is cancelled.
-func ExampleGroup_workerPool() {
-	t := &exampleTB{}
-
-	g := parleak.New(t)
-
-	jobs := make(chan int)
-	results := make(chan int, 3)
-
-	for w := 0; w < 3; w++ {
-		g.Go(fmt.Sprintf("worker-%d", w), func(ctx context.Context) {
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case j, ok := <-jobs:
-					if !ok {
-						return
-					}
-					results <- j * j
-				}
-			}
-		})
-	}
-
-	for _, j := range []int{2, 3, 4} {
-		jobs <- j
-	}
-	close(jobs)
-
-	sum := 0
-	for i := 0; i < 3; i++ {
-		sum += <-results
-	}
-	fmt.Println("sum of squares:", sum)
-
-	t.cleanup()
-	fmt.Println("leaks:", len(t.errors))
+	// The report also names the launch site (file:line from runtime.Caller) and
+	// the likely cause; only the first line is stable enough to print here.
+	fmt.Println(strings.SplitN(t.errors[0], "\n", 2)[0])
 
 	// Output:
-	// sum of squares: 29
-	// leaks: 0
+	// parleak: goroutine "poller" leaked: still running 10ms after cleanup cancelled the context
 }

@@ -247,6 +247,29 @@ func TestContextIsCancelledOnCleanup(t *testing.T) {
 	}
 }
 
+// TestGoAfterCleanupIsNotTracked pins the lifecycle boundary: check seals the
+// group and snapshots the tracked goroutines together, so a Go that lands after
+// the check has begun is not tracked and cannot produce a spurious late report.
+func TestGoAfterCleanupIsNotTracked(t *testing.T) {
+	t.Parallel()
+
+	ft := &fakeT{}
+	g := parleak.New(ft, parleak.WithTimeout(20*time.Millisecond))
+
+	ft.runCleanups() // seals the group; nothing was tracked yet
+
+	release := make(chan struct{})
+	defer close(release)
+	g.Go("late", func(ctx context.Context) { <-release }) // ignores ctx on purpose
+
+	// The goroutine is running and will not return, but because it started after
+	// the check it is untracked, so no leak is reported.
+	time.Sleep(40 * time.Millisecond)
+	if got := ft.failures(); len(got) != 0 {
+		t.Fatalf("a goroutine started after cleanup must not be tracked or reported, got: %v", got)
+	}
+}
+
 func TestZeroTimeoutReportsImmediately(t *testing.T) {
 	t.Parallel()
 

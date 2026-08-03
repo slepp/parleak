@@ -1,47 +1,30 @@
-// Package parleak detects goroutine leaks in tests that use t.Parallel.
+// Package parleak reports goroutine leaks for a single test, including tests
+// that run under t.Parallel.
 //
-// The standard leak detector, uber-go/goleak, cannot run under t.Parallel. Its
-// README says:
+// A test starts its goroutines through a [Group] instead of the go keyword. Each
+// goroutine carries a caller-supplied label and the launch site recorded by
+// [Group.Go]. [New] registers a t.Cleanup that cancels the group's context,
+// waits for the tracked goroutines to return, and reports any still running as
+// leaks. The wait is bounded by a timeout, one second by default and set with
+// [WithTimeout], so the verdict depends on it: a goroutine that returns within
+// the window passes even if it ignored cancellation, and a slow but correct
+// shutdown that exceeds the window is reported.
 //
-//	For tests that use t.Parallel, goleak does not know how to distinguish a
-//	leaky goroutine from tests that have not finished running.
-//
-// parleak covers the goroutines a parallel test owns. A test starts its
-// goroutines through a Group instead of the bare go keyword, and a t.Cleanup
-// registered by New fails the test if any are still running when it ends:
-//
-//	func TestWorker(t *testing.T) {
-//		t.Parallel()
-//
-//		g := parleak.New(t)
-//		g.Go("poller", func(ctx context.Context) {
-//			poll(ctx) // must return when ctx is done
-//		})
-//
-//		// exercise the system under test; cleanup cancels the group context,
-//		// waits up to the timeout, and names "poller" and its launch site if
-//		// it is still running.
-//	}
-//
-// Each goroutine carries a caller-supplied label and a launch site captured
-// with runtime.Caller. The wait is bounded by a default timeout of one second,
-// overridable with WithTimeout. Tracking is explicit and scoped to one test, so
-// there is no attribution guesswork and it composes with t.Parallel.
+// Tracking is explicit and scoped to one test, so parleak attributes each
+// goroutine to the test that started it, which is what lets it run under
+// t.Parallel. It sees only goroutines started through a [Group]; a goroutine
+// leaked inside a library the test calls is invisible to it. go.uber.org/goleak
+// takes a process-wide stack snapshot and can catch those, and for parallel
+// suites it recommends goleak.VerifyTestMain, which checks once per package.
+// A process-wide snapshot cannot attribute a goroutine to one test among
+// several running under t.Parallel, which is the case parleak covers.
 //
 // # Panics
 //
-// A panic in a goroutine started with the bare go keyword crashes the test
-// process. A goroutine started through Group.Go recovers instead: the panic
-// value and stack are reported as an ordinary test failure through the owning
-// test's Errorf, so the process keeps running. A goroutine already reported as
-// leaked that panics later, after the test has finished, can no longer fail
-// that test; its panic is still recovered to avoid a crash and is written to
-// standard error.
-//
-// # Limitation
-//
-// parleak only sees goroutines started through a Group. It does not catch a
-// goroutine leaked inside a third-party library a test calls; goleak covers
-// those when it can run. Use goleak in serial tests for leaks anywhere, and
-// parleak in parallel tests for the goroutines the test itself owns.
+// A goroutine started with the go keyword crashes the process if it panics. One
+// started through [Group.Go] recovers instead and reports the panic as a failure
+// of the owning test. If the panic arrives after the group's check has already
+// recorded its verdict (for example, a goroutine already reported as leaked that
+// panics later), it can no longer fail the test; it is still recovered and is
+// written to standard error.
 package parleak

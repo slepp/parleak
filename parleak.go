@@ -40,21 +40,24 @@ func WithTimeout(d time.Duration) Option {
 	return func(c *config) { c.timeout = d }
 }
 
-// WithStackDump appends a full goroutine dump to a leak report. It's off by
-// default: the per-leak report already pins the leak with a label, launch site,
-// and likely cause, and the dump is large and mostly noise. The dump contains
-// every goroutine in the process, and under t.Parallel most of those belong to
-// other tests. parleak deliberately doesn't trim it down to the leaked
-// goroutine; singling one out would need goroutine-ID matching, the unsound
-// approach this package rejects. Turn it on only when you need to see what a
-// leaked goroutine is blocked on.
+// WithStackDump appends a goroutine dump to a failing check, once per check. The
+// dump is the process-wide output of [runtime.Stack], so it also contains
+// goroutines from other tests running in parallel and is not trimmed to the
+// leaked ones. To read a leaked goroutine's stack, find it in the dump by the
+// label and launch site from the per-leak report. Use it when the launch site
+// alone is not enough and you need to see where the goroutine is blocked. It is
+// off by default.
 func WithStackDump() Option {
 	return func(c *config) { c.stackDump = true }
 }
 
-// Group tracks the goroutines started for a single test and, on cleanup,
-// reports any that outlive it. A Group is created with New and is safe for
-// concurrent use by multiple goroutines.
+// Group tracks the goroutines a single test starts through Go and, when the
+// test's cleanup runs, reports any still running after the group's context is
+// cancelled and a timeout elapses. Create a Group with New.
+//
+// A Group is safe for concurrent use, and Go may be called from any goroutine
+// while the test runs. All calls to Go must happen before the test's cleanup
+// runs; a goroutine started after the cleanup check has begun is not tracked.
 type Group struct {
 	t      TB
 	cfg    config
@@ -64,7 +67,8 @@ type Group struct {
 	mu      sync.Mutex
 	tracked []*tracked
 	panics  []panicRecord
-	closed  bool
+	sealed  bool // set when check snapshots tracked; no later goroutine is tracked
+	closed  bool // set when check has recorded its verdict; later panics go to stderr
 }
 
 type tracked struct {
@@ -80,10 +84,22 @@ type panicRecord struct {
 	stack []byte
 }
 
-// New returns a Group bound to t and registers a t.Cleanup that checks for
-// leaks when the test finishes. Because the check is registered here, a test
-// that calls New can't forget to run it. Options such as WithTimeout tune the
-// check.
+// New returns a Group bound to t and registers a t.Cleanup that runs the leak
+// check when the test ends. With a real *testing.T the cleanup runs
+// automatically, so the check is not a separate call to remember. Options such
+// as WithTimeout configure the check.
+//
+//	func TestWorker(t *testing.T) {
+//		t.Parallel()
+//
+//		g := parleak.New(t)
+//		g.Go("poller", func(ctx context.Context) {
+//			poll(ctx) // must return when ctx is done
+//		})
+//
+//		// exercise the system under test; the registered cleanup then cancels
+//		// the context and reports "poller" if it is still running.
+//	}
 func New(t TB, opts ...Option) *Group {
 	cfg := config{timeout: defaultTimeout}
 	for _, o := range opts {
@@ -113,7 +129,9 @@ func (g *Group) Go(label string, fn func(ctx context.Context)) {
 	tr := &tracked{label: label, file: file, line: line, done: make(chan struct{})}
 
 	g.mu.Lock()
-	g.tracked = append(g.tracked, tr)
+	if !g.sealed {
+		g.tracked = append(g.tracked, tr)
+	}
 	g.mu.Unlock()
 
 	go func() {
@@ -129,10 +147,11 @@ func (g *Group) Go(label string, fn func(ctx context.Context)) {
 			reportedLate := g.closed
 			g.mu.Unlock()
 			if reportedLate {
-				// The test already finished (this goroutine was reported as
-				// leaked). It can no longer be failed, but the panic is
-				// recovered so the process survives; note it on stderr.
-				fmt.Fprintf(os.Stderr, "parleak: goroutine %q panicked after its test finished: %v\n%s\n",
+				// The group's check has already recorded its verdict (closed is
+				// set during cleanup), so this goroutine can no longer fail the
+				// test. The panic is recovered to keep the process alive and
+				// noted on stderr.
+				fmt.Fprintf(os.Stderr, "parleak: goroutine %q panicked after its group's leak check finished: %v\n%s\n",
 					tr.label, r, stack)
 			}
 		}()
@@ -146,7 +165,16 @@ func (g *Group) check() {
 	g.t.Helper()
 	g.cancel()
 
-	leaked := g.wait()
+	// Seal the group and snapshot the tracked goroutines under the same lock, so
+	// the snapshot is final: a Go racing with cleanup either lands before the
+	// seal and is in the snapshot, or lands after and is not tracked.
+	g.mu.Lock()
+	g.sealed = true
+	list := make([]*tracked, len(g.tracked))
+	copy(list, g.tracked)
+	g.mu.Unlock()
+
+	leaked := g.wait(list)
 
 	g.mu.Lock()
 	g.closed = true
@@ -162,31 +190,24 @@ func (g *Group) check() {
 		return
 	}
 
-	// Report each leaked goroutine as its own short, sharp failure. The label
-	// and launch site are what actually pin the bug, so this is the default and
-	// only output.
+	// The label and launch site pin each leak, so the per-leak report is the
+	// default and only output.
 	for _, tr := range leaked {
 		g.t.Errorf("%s", formatLeak(tr, g.cfg.timeout))
 	}
 
-	// A full goroutine dump is opt-in (WithStackDump). It's process-wide and,
-	// under t.Parallel, mostly other tests' goroutines, so it's off by default.
-	// When on, emit it exactly once per check regardless of how many leaked.
+	// The process-wide dump is opt-in via WithStackDump; when on, emit it once
+	// per check regardless of how many goroutines leaked.
 	if g.cfg.stackDump {
 		dump := stripReporterFrame(captureStack(true))
 		g.t.Errorf("%s", formatDump(len(leaked), dump))
 	}
 }
 
-// wait waits up to the configured timeout for the tracked goroutines to finish
-// and returns those still running. It waits at most one timeout in total, not
-// one per goroutine.
-func (g *Group) wait() []*tracked {
-	g.mu.Lock()
-	list := make([]*tracked, len(g.tracked))
-	copy(list, g.tracked)
-	g.mu.Unlock()
-
+// wait waits up to the configured timeout for the goroutines in list to return
+// and returns those still running. The timeout bounds the whole wait, not each
+// goroutine.
+func (g *Group) wait(list []*tracked) []*tracked {
 	if len(list) == 0 {
 		return nil
 	}
