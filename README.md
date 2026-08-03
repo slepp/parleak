@@ -1,0 +1,144 @@
+# parleak
+
+`parleak` catches goroutine leaks in tests that use `t.Parallel()`. It tracks
+the goroutines a test starts and, when the test ends, fails it if any are still
+running — naming the goroutine and the line it was launched from.
+
+## The problem
+
+`t.Parallel()` is normal, encouraged Go testing practice. The standard leak
+detector, [`uber-go/goleak`](https://github.com/uber-go/goleak), can't run under
+it. From goleak's own README
+([Note](https://github.com/uber-go/goleak/blob/master/README.md#note)):
+
+> For tests that use [t.Parallel](https://pkg.go.dev/testing#T.Parallel), `goleak` does
+> not know how to distinguish a leaky goroutine from tests that have not finished running.
+
+goleak's example even labels the spot: `t.Parallel() // <- goleak gets confused here!`
+
+So the ecosystem's leak detector doesn't work in the ecosystem's normal testing
+style. That's the gap `parleak` fills.
+
+A goroutine that ignores its context is the bug this catches:
+
+```go
+func TestWorker(t *testing.T) {
+	t.Parallel()
+
+	stop := make(chan struct{})
+	go func() {
+		<-stop // never closed; this goroutine outlives the test
+		poll()
+	}()
+
+	// test passes, the goroutine leaks, and nothing tells you
+}
+```
+
+## Install
+
+```sh
+go get github.com/slepp/parleak
+```
+
+Standard library only, no dependencies.
+
+## 60-second example
+
+Launch goroutines through the group. Everything else is automatic.
+
+```go
+func TestWorker(t *testing.T) {
+	t.Parallel()
+
+	g := parleak.New(t)             // registers t.Cleanup itself
+	g.Go("poller", func(ctx context.Context) {
+		poll(ctx)                   // must return when ctx is done
+	})
+
+	// exercise the system under test...
+
+	// Cleanup runs here automatically: it cancels the group context, waits up
+	// to a second, and if "poller" is still running it fails the test with:
+	//
+	//   parleak: goroutine "poller" leaked: still running 1s after cleanup
+	//   cancelled the context
+	//       launched at worker_test.go:42
+	//       likely cause: the goroutine didn't return when ctx.Done() was closed
+	//       goroutine stacks at leak time: ...
+}
+```
+
+`New(t)` registers the check, so a test can't forget it. Each goroutine gets a
+label and an automatically captured launch site (`runtime.Caller`), so the
+failure points at real code. Override the wait with
+`parleak.New(t, parleak.WithTimeout(2*time.Second))`. `g.Context()` returns the
+same context, to hand to the code under test.
+
+## Why explicit tracking
+
+The obvious approach — snapshot `runtime.Stack` at the start and at cleanup,
+diff them, blame this test — is a trap under `t.Parallel()`. Goroutine IDs
+aren't a public API, creation stacks don't give a full ancestry chain, and other
+parallel tests' goroutines drift in and out of the window. That makes a flaky
+leak detector, which is worse than none.
+
+`parleak` sidesteps all of it: the test says which goroutines are its own, so
+there's no attribution to get wrong. That's what makes it safe under
+`t.Parallel()`.
+
+## Panics
+
+A goroutine started with the bare `go` keyword that panics takes the whole test
+process down, and the crash is hard to pin on a test. A goroutine started with
+`g.Go` recovers instead: the panic value and stack are reported as an ordinary
+failure of the test that owns it, and the process keeps running. (A goroutine
+already reported as leaked that panics later, after its test has finished, can't
+fail that test anymore; its panic is still recovered so the process survives,
+and it's written to stderr.)
+
+## Complementary to goleak, not a replacement
+
+Use both. They cover different leaks:
+
+| | serial tests | `t.Parallel()` tests |
+|---|---|---|
+| leaks anywhere, including inside libraries you call | `goleak` | — |
+| leaks in goroutines your test starts | `goleak` or `parleak` | `parleak` |
+
+`goleak` is the right tool whenever it can run, and it catches more: it sees
+every goroutine, including ones leaked deep inside a dependency. Reach for
+`parleak` for the case `goleak` names as its own limitation — parallel tests —
+and for the goroutines those tests own.
+
+## The honest limitation
+
+`parleak` only sees goroutines started through a `Group`. It will not catch a
+goroutine leaked inside a third-party library a test happens to call — it never
+saw that `go` statement. `goleak` does catch those. If a test's own goroutines
+all go through `g.Go`, `parleak` covers them; anything else is out of its view
+by design.
+
+## Not in scope
+
+- **Catching leaks you didn't start through the group.** That needs whole-runtime
+  inspection, which is `goleak`'s job and is unsound under `t.Parallel()`.
+- **A `TestMain`/package-level mode.** Tracking is per-test on purpose; that's
+  what composes with `t.Parallel()`.
+- **Goroutine-ID or stack diffing.** Rejected deliberately — see
+  [Why explicit tracking](#why-explicit-tracking).
+- **A parent-context option.** The group derives from `context.Background()`. If
+  this proves necessary it can be added without breaking the surface.
+
+## License
+
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
+- MIT license ([LICENSE-MIT](LICENSE-MIT))
+
+at your option.
+
+Unless you explicitly state otherwise, any contribution intentionally submitted
+for inclusion in the work by you, as defined in the Apache-2.0 license, shall be
+dual licensed as above, without any additional terms or conditions.
