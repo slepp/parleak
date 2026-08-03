@@ -41,11 +41,14 @@ func WithTimeout(d time.Duration) Option {
 }
 
 // WithStackDump appends a process-wide goroutine dump to the leak reports, once
-// per check. The dump is the raw output of [runtime.Stack]; it contains
-// goroutines from other tests running in parallel and is not trimmed to the
-// leaked ones. Identify a worker by its own function names and blocking state:
-// the frame directly below its "created by parleak..." line is the function
-// passed to Go. The label does not appear in the dump.
+// per check. The dump is the output of [runtime.Stack], stripped of parleak's
+// own reporting frame and indented; it contains goroutines from other tests
+// running in parallel and is not trimmed to the leaked ones. Every goroutine
+// parleak started ends its block with "created by
+// github.com/slepp/parleak.(*Group).Go", so search for that string to find them
+// all; within a block the top frame is where the goroutine is blocked, and the
+// function passed to Go sits directly above the parleak.(*Group).Go.func1
+// wrapper frame. The label does not appear in the dump.
 func WithStackDump() Option {
 	return func(c *config) { c.stackDump = true }
 }

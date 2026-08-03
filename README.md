@@ -34,11 +34,14 @@ line of a report reads:
 parleak: goroutine "poller" leaked: still running 1s after cleanup cancelled the context
 ```
 
-`t.Errorf` frames and indents the rest: the launch site, which is the file
-string returned by `runtime.Caller`, and the likely cause. `WithStackDump` adds
-the raw process-wide `runtime.Stack` output to the leak reports; find a worker
-by its own function names and blocking state, in the frame directly below its
-`created by parleak...` line.
+parleak indents the rest: the launch site, which is the file string returned by
+`runtime.Caller`, and the likely cause; `t.Errorf` adds only its own file:line
+prefix. `WithStackDump` adds the process-wide `runtime.Stack` output to the leak
+reports, stripped of parleak's reporting frame and indented. Every goroutine
+parleak started ends its block with `created by
+github.com/slepp/parleak.(*Group).Go`, so search the dump for that string; the
+top frame is where the goroutine is blocked, and the function passed to `Go`
+sits directly above the `parleak.(*Group).Go.func1` wrapper frame.
 
 Pass `g.Context()` to the system under test so cancellation reaches shared
 state.
