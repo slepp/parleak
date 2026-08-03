@@ -45,7 +45,7 @@ func WithTimeout(d time.Duration) Option {
 // and likely cause, and the dump is large and mostly noise. The dump contains
 // every goroutine in the process, and under t.Parallel most of those belong to
 // other tests. parleak deliberately doesn't trim it down to the leaked
-// goroutine — singling one out would need goroutine-ID matching, the unsound
+// goroutine; singling one out would need goroutine-ID matching, the unsound
 // approach this package rejects. Turn it on only when you need to see what a
 // leaked goroutine is blocked on.
 func WithStackDump() Option {
@@ -82,7 +82,8 @@ type panicRecord struct {
 
 // New returns a Group bound to t and registers a t.Cleanup that checks for
 // leaks when the test finishes. Because the check is registered here, a test
-// can't forget to run it. Options such as WithTimeout tune the check.
+// that calls New can't forget to run it. Options such as WithTimeout tune the
+// check.
 func New(t TB, opts ...Option) *Group {
 	cfg := config{timeout: defaultTimeout}
 	for _, o := range opts {
@@ -228,7 +229,7 @@ func formatLeak(tr *tracked, timeout time.Duration) string {
 func formatDump(n int, dump []byte) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "parleak: %d goroutine(s) leaked; dumping every goroutine in the process below "+
-		"(not just the leaked ones — the launch sites above pin those; parleak can't single a "+
+		"(not just the leaked ones. The launch sites above pin those; parleak can't single a "+
 		"goroutine out of the dump without unsound goroutine-ID matching):\n", n)
 	b.WriteString(indent(string(dump)))
 	return b.String()
@@ -259,7 +260,7 @@ func captureStack(all bool) []byte {
 }
 
 // stripReporterFrame drops the leading stack block belonging to parleak's own
-// cleanup goroutine — the one that called runtime.Stack — so the dump opens on
+// cleanup goroutine, the one that called runtime.Stack, so the dump opens on
 // application goroutines rather than library internals. runtime.Stack always
 // lists the calling goroutine first. This isn't leak attribution: it only
 // removes the reporter's own frame, which is always present and never useful.
