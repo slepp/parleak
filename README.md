@@ -101,6 +101,47 @@ srv := newServer(g.Context()) // shares the group's cancellation
 g.Go("reader", srv.readLoop)
 ```
 
+## Refactoring your code for parleak
+
+parleak only sees goroutines started through `g.Go` — "launch through the group"
+is a requirement, not a suggestion. A goroutine a library spawns internally with
+a bare `go` is invisible to it. To make one visible, expose its body as a plain
+work function and let the test start it:
+
+```go
+// BEFORE — the goroutine is hidden inside Start, so parleak never sees it.
+func (w *Watcher) Start(ctx context.Context) <-chan string {
+	out := make(chan string)
+	go w.Run(ctx, out) // bare go — invisible to parleak
+	return out
+}
+
+// AFTER — expose the goroutine body as a plain work function.
+func (w *Watcher) Run(ctx context.Context, out chan<- string) {
+	// ... same loop; returns when ctx is done ...
+}
+
+// In the test, the test starts it and owns its lifecycle:
+out := make(chan string)
+g.Go("watcher", func(ctx context.Context) { w.Run(ctx, out) })
+```
+
+(The closure is only needed to bind the extra `out` argument. A work function
+that already has the shape `func(context.Context)` — say `w.Poll` — goes
+straight in: `g.Go("poller", w.Poll)`.)
+
+This is good design on its own merits: it separates *what to do* (the library's
+`Run` method) from *how to run it* (the test's `g.Go` call), and the test
+explicitly owns the goroutine's lifecycle. **Production code never imports
+parleak** — the refactor only exposes a work function, so no test dependency
+bleeds into the library.
+
+The cost is real, though: a mature library that spawns goroutines internally has
+to be restructured to expose those work functions. Each change is small, but on
+an existing codebase there can be many. Weigh it like the goleak trade-off below
+— for goroutines a test owns and can start itself, the visibility is worth it;
+for anything spawned deep inside code you don't control, reach for goleak.
+
 ## Why explicit tracking
 
 The obvious approach — snapshot `runtime.Stack` at the start and at cleanup,
