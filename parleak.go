@@ -28,7 +28,8 @@ type TB interface {
 type Option func(*config)
 
 type config struct {
-	timeout time.Duration
+	timeout   time.Duration
+	stackDump bool
 }
 
 // WithTimeout sets how long a Group waits, after cancelling its context, for a
@@ -37,6 +38,18 @@ type config struct {
 // hasn't already returned is reported immediately.
 func WithTimeout(d time.Duration) Option {
 	return func(c *config) { c.timeout = d }
+}
+
+// WithStackDump appends a full goroutine dump to a leak report. It's off by
+// default: the per-leak report already pins the leak with a label, launch site,
+// and likely cause, and the dump is large and mostly noise. The dump contains
+// every goroutine in the process, and under t.Parallel most of those belong to
+// other tests. parleak deliberately doesn't trim it down to the leaked
+// goroutine — singling one out would need goroutine-ID matching, the unsound
+// approach this package rejects. Turn it on only when you need to see what a
+// leaked goroutine is blocked on.
+func WithStackDump() Option {
+	return func(c *config) { c.stackDump = true }
 }
 
 // Group tracks the goroutines started for a single test and, on cleanup,
@@ -148,18 +161,20 @@ func (g *Group) check() {
 		return
 	}
 
-	// Capture the process-wide dump once, at the moment leaks are detected.
-	dump := stripReporterFrame(captureStack(true))
-
 	// Report each leaked goroutine as its own short, sharp failure. The label
-	// and launch site are what actually pin the bug.
+	// and launch site are what actually pin the bug, so this is the default and
+	// only output.
 	for _, tr := range leaked {
 		g.t.Errorf("%s", formatLeak(tr, g.cfg.timeout))
 	}
 
-	// Emit the dump exactly once per check, regardless of how many goroutines
-	// leaked, so the output isn't multiplied into near-identical copies.
-	g.t.Errorf("%s", formatDump(len(leaked), dump))
+	// A full goroutine dump is opt-in (WithStackDump). It's process-wide and,
+	// under t.Parallel, mostly other tests' goroutines, so it's off by default.
+	// When on, emit it exactly once per check regardless of how many leaked.
+	if g.cfg.stackDump {
+		dump := stripReporterFrame(captureStack(true))
+		g.t.Errorf("%s", formatDump(len(leaked), dump))
+	}
 }
 
 // wait waits up to the configured timeout for the tracked goroutines to finish

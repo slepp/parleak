@@ -4,6 +4,12 @@
 the goroutines a test starts and, when the test ends, fails it if any are still
 running — naming the goroutine and the line it was launched from.
 
+**Scope, up front:** parleak only sees goroutines you start through it. It does
+not watch the whole runtime, so it won't catch a goroutine leaked inside a
+library you call — that's [`goleak`](https://github.com/uber-go/goleak)'s job.
+The two are [complementary](#complementary-to-goleak-not-a-replacement), and the
+[limitation](#the-honest-limitation) is spelled out below.
+
 ## The problem
 
 `t.Parallel()` is normal, encouraged Go testing practice. The standard leak
@@ -65,15 +71,35 @@ func TestWorker(t *testing.T) {
 	//   cancelled the context
 	//       launched at worker_test.go:42
 	//       likely cause: the goroutine didn't return when ctx.Done() was closed
-	//       goroutine stacks at leak time: ...
 }
 ```
 
 `New(t)` registers the check, so a test can't forget it. Each goroutine gets a
 label and an automatically captured launch site (`runtime.Caller`), so the
-failure points at real code. Override the wait with
-`parleak.New(t, parleak.WithTimeout(2*time.Second))`. `g.Context()` returns the
-same context, to hand to the code under test.
+failure points at real code — that label plus launch line is what pins the leak,
+and it's the whole default output.
+
+Two options tune it:
+
+- `parleak.New(t, parleak.WithTimeout(2*time.Second))` changes how long cleanup
+  waits before calling a goroutine leaked (default one second).
+- `parleak.New(t, parleak.WithStackDump())` appends a full goroutine dump to a
+  leak report, for when you need to see what a goroutine is blocked on. It's
+  off by default because the dump is process-wide — under `t.Parallel()` most of
+  it is *other* tests' goroutines — and parleak deliberately won't filter it
+  down to the leaked goroutine (that needs goroutine-ID matching, the unsound
+  approach [it rejects](#why-explicit-tracking)).
+
+`g.Context()` returns the group's context — the same one `g.Go` hands each
+goroutine. It's rarely needed; reach for it when you must build the system under
+test *before* launching goroutines, so the same cancellation reaches shared
+state the goroutines depend on:
+
+```go
+g := parleak.New(t)
+srv := newServer(g.Context()) // shares the group's cancellation
+g.Go("reader", srv.readLoop)
+```
 
 ## Why explicit tracking
 

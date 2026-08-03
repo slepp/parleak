@@ -267,55 +267,71 @@ func TestZeroTimeoutReportsImmediately(t *testing.T) {
 	}
 }
 
-// TestDumpEmittedOncePerCheck is the regression guard for a defect found only
-// in an end-to-end run: the full process-wide goroutine dump was embedded into
-// every leak message, so N leaked goroutines produced N near-identical dumps.
-// The dump must appear exactly once per check no matter how many goroutines
-// leak, while each leak still gets its own sharp, dump-free report.
-func TestDumpEmittedOncePerCheck(t *testing.T) {
+// TestDefaultOutputIsBoundedAndDumpIsOptIn guards two related properties found
+// the hard way in end-to-end stress runs: a process-wide goroutine dump per
+// failing test produced ~1.18MB / 19k lines, most of it other parallel tests'
+// goroutines. By default parleak emits only the short per-leak report; the dump
+// is opt-in via WithStackDump and, when on, appears exactly once per check.
+func TestDefaultOutputIsBoundedAndDumpIsOptIn(t *testing.T) {
 	t.Parallel()
 
-	release := make(chan struct{})
-	defer close(release)
-
 	labels := []string{"leak-a", "leak-b", "leak-c"}
-	ft := &fakeT{}
-	g := parleak.New(ft, parleak.WithTimeout(30*time.Millisecond))
+
+	// Default: sharp per-leak reports only, no process-wide dump.
+	release1 := make(chan struct{})
+	defer close(release1)
+	ftDefault := &fakeT{}
+	gDefault := parleak.New(ftDefault, parleak.WithTimeout(30*time.Millisecond))
 	for _, name := range labels {
-		g.Go(name, func(ctx context.Context) { <-release })
+		gDefault.Go(name, func(ctx context.Context) { <-release1 })
+	}
+	ftDefault.runCleanups()
+
+	def := ftDefault.failures()
+	if len(def) != len(labels) {
+		t.Fatalf("default output should be one report per leak, got %d messages: %v", len(def), def)
+	}
+	defJoined := strings.Join(def, "\n")
+	if strings.Contains(defJoined, "dumping every goroutine") {
+		t.Fatalf("default output must not include a process-wide dump:\n%s", defJoined)
+	}
+	for _, name := range labels {
+		if !strings.Contains(defJoined, `"`+name+`"`) {
+			t.Fatalf("expected a report naming %q, got: %v", name, def)
+		}
+	}
+	// The 1.18MB / 19k-line regression must not come back: a few leaks stay tiny.
+	const ceiling = 4 << 10
+	if n := len(defJoined); n > ceiling {
+		t.Fatalf("default output for %d leaks was %d bytes, over the %d-byte ceiling", len(labels), n, ceiling)
 	}
 
-	ft.runCleanups()
+	// Opt in with WithStackDump: the same sharp reports, plus exactly one dump.
+	release2 := make(chan struct{})
+	defer close(release2)
+	ftDump := &fakeT{}
+	gDump := parleak.New(ftDump, parleak.WithTimeout(30*time.Millisecond), parleak.WithStackDump())
+	for _, name := range labels {
+		gDump.Go(name, func(ctx context.Context) { <-release2 })
+	}
+	ftDump.runCleanups()
 
-	msgs := ft.failures()
-
-	// Exactly one message per leaked goroutine, plus one dump message.
 	var leakMsgs, dumpMsgs int
-	for _, m := range msgs {
+	for _, m := range ftDump.failures() {
 		if strings.Contains(m, "leaked: still running") {
 			leakMsgs++
-			// A per-leak report must stay sharp: no embedded goroutine dump.
-			if strings.Contains(m, "dumping every goroutine") || strings.Contains(m, "goroutine 1 [") {
-				t.Fatalf("per-leak report must not embed the dump, got:\n%s", m)
+			if strings.Contains(m, "dumping every goroutine") {
+				t.Fatalf("per-leak report must stay dump-free:\n%s", m)
 			}
 		}
 		if strings.Contains(m, "dumping every goroutine") {
 			dumpMsgs++
 		}
 	}
-
 	if leakMsgs != len(labels) {
-		t.Fatalf("want %d leak reports, got %d: %v", len(labels), leakMsgs, msgs)
+		t.Fatalf("want %d leak reports with the option on, got %d", len(labels), leakMsgs)
 	}
 	if dumpMsgs != 1 {
 		t.Fatalf("dump must be emitted exactly once per check, got %d times", dumpMsgs)
-	}
-
-	// Every leaked goroutine is still named.
-	joined := strings.Join(msgs, "\n")
-	for _, name := range labels {
-		if !strings.Contains(joined, `"`+name+`"`) {
-			t.Fatalf("expected a report naming %q, got: %v", name, msgs)
-		}
 	}
 }
