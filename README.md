@@ -186,6 +186,35 @@ saw that `go` statement. `goleak` does catch those. If a test's own goroutines
 all go through `g.Go`, `parleak` covers them; anything else is out of its view
 by design.
 
+## API
+
+The whole surface, six names:
+
+```go
+func New(t TB, opts ...Option) *Group
+func (g *Group) Go(label string, fn func(ctx context.Context))
+func (g *Group) Context() context.Context
+
+func WithTimeout(d time.Duration) Option   // default 1s
+func WithStackDump() Option                // off by default
+
+type TB interface {                        // *testing.T and *testing.B satisfy it
+	Errorf(format string, args ...any)
+	Cleanup(func())
+	Helper()
+}
+```
+
+`New` registers the cleanup check itself, so a test can't forget it. `Go` records
+the label and launch site and recovers panics. `Context` hands back the group's
+context for wiring up a system under test before any goroutine starts.
+
+The timeout is a bound on *total* cleanup, not per goroutine — fifty leaked
+goroutines with the default still finish in about a second, not fifty.
+
+`TB` exists so the failure path is testable: parleak's own suite drives it with a
+double instead of failing real tests.
+
 ## Not in scope
 
 - **Catching leaks you didn't start through the group.** That needs whole-runtime
