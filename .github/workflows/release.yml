@@ -1,0 +1,56 @@
+name: Release
+
+# Go has no registry to upload to: the tag is the release, and the module proxy
+# serves it straight from this repository. So this does not publish anything.
+# It verifies the tag is a usable release, and warms proxy.golang.org so the
+# first person to fetch it does not pay for the cold path.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      - run: go vet ./...
+      - run: go test ./...
+
+      - name: Module path must match this repository
+        # A go.mod naming a different path produces a tag that resolves to
+        # somebody else's code, or to nothing at all.
+        run: |
+          set -eu
+          want="github.com/${GITHUB_REPOSITORY}"
+          got=$(go list -m)
+          if [ "$want" != "$got" ]; then
+            echo "go.mod module is $got but this repository is $want"
+            exit 1
+          fi
+
+      - name: Fetch the tagged version through the public proxy
+        # Proves the release is installable by someone who is not us, which is
+        # the only claim that matters for a Go module.
+        run: |
+          set -eu
+          mkdir -p /tmp/consumer && cd /tmp/consumer
+          go mod init consumer
+          for attempt in 1 2 3 4 5 6; do
+            if GOPROXY=https://proxy.golang.org,direct GOFLAGS= \
+               go get "github.com/${GITHUB_REPOSITORY}@${GITHUB_REF_NAME}"; then
+              echo "resolved ${GITHUB_REF_NAME} from the public proxy"
+              exit 0
+            fi
+            echo "proxy has not indexed the tag yet, retrying in 20s ($attempt/6)"
+            sleep 20
+          done
+          echo "the proxy never served ${GITHUB_REF_NAME}"
+          exit 1
